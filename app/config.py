@@ -14,6 +14,9 @@ HOURS_PER_DAY = 24
 # 单批最多接收的记录数，避免一次事务过大。
 MAX_BATCH_RECORDS = 1000
 
+# 单次转移最多涉及的小时数（与批量补报保持同一量级）。
+MAX_TRANSFER_HOURS = 1000
+
 # 输入中的 date/hour 表示北京时间（Asia/Shanghai）下的观测日期与小时。
 BEIJING_TIMEZONE = "Asia/Shanghai"
 

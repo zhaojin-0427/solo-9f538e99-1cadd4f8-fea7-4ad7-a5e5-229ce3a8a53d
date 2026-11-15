@@ -39,8 +39,20 @@ CREATE TABLE IF NOT EXISTS pm25_readings (
 );
 """
 
-# 主键 (station_id, obs_date, hour, revision) 已覆盖日报查询的等值前缀，
-# 无需额外索引。
+# 转移操作登记表：操作号全局唯一；请求指纹用于同号同内容幂等重放、同号异内容冲突。
+# 一次转移的结果与两站读数在同一个写事务里提交，因此操作记录存在即代表转移已生效。
+TRANSFER_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS pm25_transfer_operations (
+    operation_id        TEXT PRIMARY KEY,
+    request_fingerprint TEXT NOT NULL,   -- 规范化请求指纹（不含 operation_id）
+    request_json        TEXT NOT NULL,   -- 规范化原始请求，冲突时回显
+    result_json         TEXT NOT NULL,   -- 首次执行的结果，重放时原样返回
+    status              TEXT NOT NULL,   -- 当前只有 applied
+    created_at          TEXT NOT NULL,
+    CHECK (length(operation_id) > 0),
+    CHECK (status = 'applied')
+);
+"""
 
 
 class Database:
@@ -60,6 +72,7 @@ class Database:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA synchronous=NORMAL")
             conn.execute(SCHEMA_SQL)
+            conn.execute(TRANSFER_SCHEMA_SQL)
         finally:
             conn.close()
 

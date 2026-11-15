@@ -1,8 +1,9 @@
-"""业务逻辑：批量写入与日报查询。"""
+"""业务逻辑：批量写入、日报查询与站点间读数转移。"""
 
 from __future__ import annotations
 
 import datetime as dt
+import json
 import sqlite3
 from dataclasses import dataclass
 
@@ -13,6 +14,8 @@ from .models import (
     DailyReport,
     HourState,
     ReadingRecord,
+    TransferConflictDetail,
+    TransferRequest,
 )
 
 
@@ -22,6 +25,23 @@ class RevisionConflictError(Exception):
     def __init__(self, conflicts: list[ConflictDetail]) -> None:
         self.conflicts = conflicts
         super().__init__(f"{len(conflicts)} revision conflict(s)")
+
+
+class TransferPreconditionError(Exception):
+    """转移前置条件不满足（源修订已变 / 源读数无效 / 目标小时已占用）：整次不生效。"""
+
+    def __init__(self, conflicts: list[TransferConflictDetail]) -> None:
+        self.conflicts = conflicts
+        super().__init__(f"{len(conflicts)} transfer precondition conflict(s)")
+
+
+class OperationIdConflictError(Exception):
+    """相同操作号但请求内容不同：冲突，本次不生效。"""
+
+    def __init__(self, existing_request: dict, submitted_request: dict) -> None:
+        self.existing_request = existing_request
+        self.submitted_request = submitted_request
+        super().__init__("operation_id already used with a different request")
 
 
 @dataclass(frozen=True)
@@ -176,6 +196,246 @@ class ReadingService:
             existing=_payload_dict(existing_payload),
             submitted=_payload_dict(submitted_payload),
         )
+
+    # -- 站点间转移 -----------------------------------------------------
+    def apply_transfer(
+        self, request: TransferRequest
+    ) -> tuple[dict, bool]:
+        """原子地把源站若干小时的当前读数转移到目标站。
+
+        全程在单个 ``BEGIN IMMEDIATE`` 写事务内完成（持写锁，与补报/其他转移串行）：
+
+        1. 操作号查重：同号同内容 → 重放原结果（replayed=True，无写入）；
+           同号异内容 → ``OperationIdConflictError``，整次不生效。
+        2. 逐小时校验前置条件：
+           * 源站该小时当前修订号必须等于查询时看到的 ``source_revision``，
+             否则 ``source_revision_changed``（不能撤回已被修订/撤回的新读数）；
+           * 该当前修订必须是带浓度值的有效读数，否则 ``source_reading_not_current``；
+           * 目标站该小时必须从未入库（没有任何修订行，含撤回），
+             否则 ``target_hour_occupied``（不能覆盖目标值）。
+        3. 校验全部通过后：为源站追加更高修订号的撤回记录（MAX(revision)+1），
+           把原浓度以 revision=1 写入目标站，并登记操作与结果；与两站记录一同 COMMIT。
+
+        任一前置条件不满足或写入失败均在 COMMIT 前抛错并整体 ROLLBACK。
+        """
+        obs_date = request.date.isoformat()
+        # 请求指纹只包含业务内容，不含 operation_id；hours 按小时排序后规范化，
+        # 使同内容的重试在条目顺序不同时仍被识别为同一请求。
+        canonical = {
+            "source_station_id": request.source_station_id,
+            "target_station_id": request.target_station_id,
+            "date": obs_date,
+            "hours": sorted(
+                (
+                    {"hour": item.hour, "source_revision": item.source_revision}
+                    for item in request.hours
+                ),
+                key=lambda h: h["hour"],
+            ),
+        }
+        fingerprint = json.dumps(
+            canonical, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+        )
+        submitted_request = dict(canonical)
+
+        conn = self.db.connect()
+        try:
+            with Database.write_transaction(conn):
+                # 1) 操作号登记查重（此时已持有写锁，登记行的检查-插入之间无竞态）。
+                operation_row = conn.execute(
+                    "SELECT request_fingerprint, request_json, result_json "
+                    "FROM pm25_transfer_operations WHERE operation_id = ?",
+                    (request.operation_id,),
+                ).fetchone()
+                if operation_row is not None:
+                    if operation_row["request_fingerprint"] != fingerprint:
+                        raise OperationIdConflictError(
+                            existing_request=json.loads(operation_row["request_json"]),
+                            submitted_request=submitted_request,
+                        )
+                    # 同号同内容：原结果原样返回，不做任何写入。
+                    return json.loads(operation_row["result_json"]), True
+
+                hours = sorted((item.hour for item in request.hours))
+                expected_revision = {item.hour: item.source_revision for item in request.hours}
+
+                # 2) 读取源站涉及小时的全部修订，定位每个小时的当前（最大修订号）行。
+                source_rows = self._load_hour_rows(
+                    conn, request.source_station_id, obs_date, hours
+                )
+                # 3) 读取目标站涉及小时的全部修订（任何一行存在都算已入库）。
+                target_rows = self._load_hour_rows(
+                    conn, request.target_station_id, obs_date, hours
+                )
+
+                conflicts: list[TransferConflictDetail] = []
+                for hour in hours:
+                    source_latest = source_rows.get(hour)
+                    current_revision = None if source_latest is None else source_latest["revision"]
+                    if current_revision != expected_revision[hour]:
+                        # 查询之后源修订已被补报/撤回/再次转移改写（含当前已撤回、
+                        # 小时被删空等情况）→ 一律视为修订已变化，不能撤回新读数。
+                        conflicts.append(
+                            TransferConflictDetail(
+                                reason="source_revision_changed",
+                                station_id=request.source_station_id,
+                                date=obs_date,
+                                hour=hour,
+                                expected_revision=expected_revision[hour],
+                                current_revision=current_revision,
+                                message=(
+                                    "source hour no longer has any reading"
+                                    if source_latest is None
+                                    else "source revision changed since the reading was queried"
+                                ),
+                            )
+                        )
+                        continue
+                    if bool(source_latest["retracted"]):
+                        # 修订号虽未变化，但该修订本身是撤回：没有可转移的有效读数。
+                        conflicts.append(
+                            TransferConflictDetail(
+                                reason="source_reading_not_current",
+                                station_id=request.source_station_id,
+                                date=obs_date,
+                                hour=hour,
+                                expected_revision=expected_revision[hour],
+                                current_revision=current_revision,
+                                message="source hour's current revision is a retraction",
+                            )
+                        )
+                        continue
+                    if hour in target_rows:
+                        # 目标站该小时已有入库记录（含历史撤回）→ 不能覆盖目标值。
+                        conflicts.append(
+                            TransferConflictDetail(
+                                reason="target_hour_occupied",
+                                station_id=request.target_station_id,
+                                date=obs_date,
+                                hour=hour,
+                                expected_revision=expected_revision[hour],
+                                current_revision=target_rows[hour]["revision"],
+                                message="target station already has a record for this hour",
+                            )
+                        )
+
+                if conflicts:
+                    # with 块内抛错 → ROLLBACK：两站读数与操作登记都不会落地。
+                    raise TransferPreconditionError(conflicts)
+
+                # 4) 前置条件全部满足：源站追加撤回、目标站写入原值，一次提交。
+                now = utc_timestamp()
+                hour_results = []
+                for hour in hours:
+                    source_latest = source_rows[hour]
+                    value = source_latest["value"]
+                    retraction_revision = source_latest["revision"] + 1
+
+                    conn.execute(
+                        """
+                        INSERT INTO pm25_readings
+                            (station_id, obs_date, hour, revision, value, retracted, created_at)
+                        VALUES (?, ?, ?, ?, NULL, 1, ?)
+                        """,
+                        (
+                            request.source_station_id,
+                            obs_date,
+                            hour,
+                            retraction_revision,
+                            now,
+                        ),
+                    )
+                    # 目标站该小时已确认没有任何行，因此以 revision=1 建立首条记录。
+                    conn.execute(
+                        """
+                        INSERT INTO pm25_readings
+                            (station_id, obs_date, hour, revision, value, retracted, created_at)
+                        VALUES (?, ?, ?, 1, ?, 0, ?)
+                        """,
+                        (
+                            request.target_station_id,
+                            obs_date,
+                            hour,
+                            value,
+                            now,
+                        ),
+                    )
+                    hour_results.append(
+                        {
+                            "hour": hour,
+                            "value": value,
+                            "source_revision_before": expected_revision[hour],
+                            "source_retraction_revision": retraction_revision,
+                            "target_revision": 1,
+                        }
+                    )
+
+                result = {
+                    "operation_id": request.operation_id,
+                    "status": "applied",
+                    "source_station_id": request.source_station_id,
+                    "target_station_id": request.target_station_id,
+                    "date": obs_date,
+                    "transferred_hours": hours,
+                    "transferred_count": len(hours),
+                    "hours": hour_results,
+                    "replayed": False,
+                }
+                conn.execute(
+                    """
+                    INSERT INTO pm25_transfer_operations
+                        (operation_id, request_fingerprint, request_json,
+                         result_json, status, created_at)
+                    VALUES (?, ?, ?, ?, 'applied', ?)
+                    """,
+                    (
+                        request.operation_id,
+                        fingerprint,
+                        json.dumps(
+                            submitted_request,
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                            sort_keys=True,
+                        ),
+                        json.dumps(result, ensure_ascii=False),
+                        now,
+                    ),
+                )
+        finally:
+            conn.close()
+
+        return result, False
+
+    @staticmethod
+    def _load_hour_rows(
+        conn: sqlite3.Connection,
+        station_id: str,
+        obs_date: str,
+        hours: list[int],
+    ) -> dict[int, sqlite3.Row]:
+        """读取某站某日给定小时的全部修订，返回每小时最大修订号对应的行。"""
+        if not hours:
+            return {}
+        latest: dict[int, sqlite3.Row] = {}
+        chunk_size = 200
+        for start in range(0, len(hours), chunk_size):
+            chunk = hours[start : start + chunk_size]
+            placeholders = ",".join("?" for _ in chunk)
+            rows = conn.execute(
+                f"""
+                SELECT hour, revision, value, retracted
+                FROM pm25_readings
+                WHERE station_id = ?
+                  AND obs_date = ?
+                  AND hour IN ({placeholders})
+                """,
+                [station_id, obs_date, *chunk],
+            ).fetchall()
+            for row in rows:
+                current = latest.get(row["hour"])
+                if current is None or row["revision"] > current["revision"]:
+                    latest[row["hour"]] = row
+        return latest
 
     # -- 日报查询 -------------------------------------------------------
     def daily_report(self, station_id: str, day: dt.date) -> DailyReport:
